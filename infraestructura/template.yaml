@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cola SQS de alertas de inventario (con DLQ), funcion Lambda que la consume
+  y alarma de CloudWatch para mensajes fallidos.
+
+Parameters:
+  CodigoBucket:
+    Type: String
+    Description: Bucket S3 donde el pipeline sube el .jar de la funcion
+  CodigoKey:
+    Type: String
+    Description: Ruta del .jar dentro del bucket (cambia en cada commit para forzar la actualizacion)
+
+Resources:
+  # Cola de mensajes fallidos (Dead Letter Queue)
+  ColaAlertasFallidas:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: alertas-fallidas
+      MessageRetentionPeriod: 1209600 # 14 dias
+
+  # Cola principal: ms-inventario publica aqui las alertas de stock bajo
+  ColaInventarioAlertas:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: inventario-alertas
+      VisibilityTimeout: 60 # 6 veces el timeout de la Lambda
+      MessageRetentionPeriod: 345600 # 4 dias
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ColaAlertasFallidas.Arn
+        maxReceiveCount: 3 # tras 3 intentos fallidos pasa a la DLQ
+
+  # Funcion serverless (FaaS)
+  FuncionAlertas:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: fn-alertas-inventario
+      Description: Procesa las alertas de stock bajo publicadas por ms-inventario
+      Runtime: java21
+      Handler: cl.duoc.fnalertas.ProcesarAlertaHandler::handleRequest
+      MemorySize: 512
+      Timeout: 10
+      # En AWS Academy Learner Lab no se pueden crear roles IAM: se usa LabRole
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/LabRole
+      Code:
+        S3Bucket: !Ref CodigoBucket
+        S3Key: !Ref CodigoKey
+
+  # Conexion cola -> Lambda (trigger)
+  TriggerSqsLambda:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ColaInventarioAlertas.Arn
+      FunctionName: !Ref FuncionAlertas
+      BatchSize: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures # solo se reintentan los mensajes que fallaron
+
+  # Alarma: se activa cuando hay mensajes en la DLQ
+  AlarmaAlertasFallidas:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: alertas-fallidas-con-mensajes
+      AlarmDescription: Hay alertas de inventario que no se pudieron procesar
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ColaAlertasFallidas.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ColaAlertasUrl:
+    Description: URL de la cola (variable SQS_ALERTAS_URL de ms-inventario)
+    Value: !Ref ColaInventarioAlertas
+  ColaAlertasArn:
+    Value: !GetAtt ColaInventarioAlertas.Arn
+  ColaFallidasUrl:
+    Value: !Ref ColaAlertasFallidas
+  NombreFuncion:
+    Value: !Ref FuncionAlertas
